@@ -6,11 +6,17 @@ from shutil import rmtree
 from subprocess import call, PIPE, Popen, CalledProcessError, run
 from urllib.parse import urlparse
 from quark.utils import cmake_escape
+import hashlib
 import shutil
+import tempfile
+import tarfile
+import zipfile
+import urllib.parse
+import urllib.request
 
 import xml.etree.ElementTree as ElementTree
 
-from quark.utils import DirectoryContext as cd, fork, log_check_output
+from quark.utils import DirectoryContext as cd, fork, log_check_output, print_msg
 from quark.utils import freeze_file, dependency_file, mkdir, load_conf
 
 logger = logging.getLogger(__name__)
@@ -78,6 +84,8 @@ class Subproject:
         if urlstring is None:
             # fake project, used for non-versioned root
             res = Subproject(name, directory, options, conf, **kwargs)
+        elif url.scheme.startswith('gitlab'):
+            res = GitlabSubproject(*args, **kwargs)
         elif url.scheme.startswith('git'):
             res = GitSubproject(*args, **kwargs)
         elif url.scheme.startswith('svn'):
@@ -704,6 +712,287 @@ class SvnSubproject(Subproject):
     def set_local_ignores(self, subprojects_dir, modules):
         # Svn doesn't support local sandbox ignore lists
         pass
+
+class GitlabSubproject(Subproject):
+    def __init__(self, name, url, directory, options, conf={}, **kwargs):
+        super().__init__(name, directory, options, conf, **kwargs)
+
+        self.stamp = {
+            "job_id": None,  # GitLab job ID. Mostly used for freezing gitlab+ci URLs.
+            "sha1": None,  # SHA1 of downloaded artifact. Mostly used for freezing.
+            "url": urllib.parse.urlunparse(url),  # type: ignore
+        }  # type: dict[str, None | str]
+
+        self._gitlab_setup(url)
+        self._parse_url(url)
+
+    def update(self, clean=False, fix_remotes=False):
+        assert self.directory  # Make Pyright happy
+
+        # Check whether the last download matches the currently-wanted one.
+        #
+        # NOTE: The current logic will force a re-download after a freeze (the URL changes).
+        stamp_file = join(self.directory, ".stamp.quark")
+        if exists(join(stamp_file)):
+            with open(stamp_file, "r") as fileobj:
+                data = json.load(fileobj)
+                if data["job_id"] == self.stamp["job_id"] and data["url"] == self.stamp["url"]:
+                    return
+
+        # The stamp has changed and the directory already exists: we need to start from scratch.
+        if isdir(self.directory):
+            shutil.rmtree(self.directory)
+
+        with tempfile.TemporaryDirectory(prefix="quark-") as tempdir:
+            archive_path = self._download(tempdir)
+
+            if archive_path.endswith((".tar.bz2", ".tar.gz", ".tar.xz", ".zip")):
+                self._extract(archive_path, tempdir)
+            else:
+                os.mkdir(self.directory)
+                shutil.copy2(archive_path, self.directory)
+
+        # Update the stamp file
+        with open(stamp_file, "w") as fileobj:
+            json.dump(self.stamp, fileobj)
+
+    def url_from_directory(self, directory, include_commit=True):
+        stamp_file = join(directory, ".stamp.quark")
+        if not exists(stamp_file):
+            raise QuarkError("Missing stamp file: " + stamp_file)
+
+        with open(stamp_file, "r") as fileobj:
+            stamp = json.load(fileobj)
+
+        if not include_commit:
+            return stamp["url"]
+
+        if not stamp["sha1"]:
+            raise QuarkError("Missing sha1 in stamp file: " + stamp_file)
+
+        # Resolve job ID if needed.
+        url = urllib.parse.urlparse(stamp["url"])
+        fragments = Subproject._parse_fragment(url) if url.fragment else {}
+        if "ref" in fragments:
+            print_msg("resolving job id for " + self.parsed_artifact_name, self._comment())
+            stamp["job_id"] = self._resolve_job_id(
+                self.parsed_project_name,
+                fragments["ref"],
+                fragments["job"],
+            )
+
+        # Generate frozen URL.
+        new_fragments = ["sha1=" + stamp["sha1"]]
+        if stamp["job_id"]:
+            new_fragments.append("job=" + stamp["job_id"])
+
+        new_url = urllib.parse.urlparse(stamp["url"])
+        new_url = new_url._replace(fragment="&".join(new_fragments))
+
+        return urllib.parse.urlunparse(new_url)
+
+    def _gitlab_setup(self, url):
+        self.gitlab_url = "https://" + url.netloc  # Enforce HTTPS for now.
+
+        # Try private token variables, in order of importance. GITLAB_PRIVATE_TOKEN is commonly used
+        # by python-gitlab's "gitlab" CLI tool, whereas GITLAB_TOKEN is used by GitLab's "glab" CLI
+        # tool.
+        for var in ("QUARK_GITLAB_PRIVATE_TOKEN", "GITLAB_PRIVATE_TOKEN", "GITLAB_TOKEN"):
+            if var in os.environ:
+                self.gitlab_token = os.environ[var]
+                self.gitlab_token_header = "PRIVATE-TOKEN"
+                self.gitlab_token_is_pat = True  # Is this a Personal/Private Access Token? (PAT)
+                return
+
+        # If we're running in a CI job, use the CI_JOB_TOKEN.
+        if "CI_JOB_TOKEN" in os.environ:
+            self.gitlab_token = os.environ["CI_JOB_TOKEN"]
+            self.gitlab_token_header = "JOB-TOKEN"
+            self.gitlab_token_is_pat = False  # Is this a Personal/Private Access Token? (PAT)
+            return
+
+        raise QuarkError("Missing authentication token.")
+
+    def _parse_url(self, url):
+        fragments = Subproject._parse_fragment(url) if url.fragment else {}
+
+        # There are mainly used for logging messages.
+        self.parsed_job = None
+        self.parsed_ref = None
+        self.parsed_pkg = None
+
+        self.stamp["sha1"] = fragments.get("sha1")
+
+        if url.scheme == "gitlab+ci":
+            if "job" not in fragments:
+                raise QuarkError("Missing job fragment in URL: " + url)
+
+            if "ref" in fragments and "job" not in fragments:
+                raise QuarkError("Missing job fragment in URL when ref is given: " + url)
+
+            parts = url.path.split("/")
+
+            self.parsed_project_name = "/".join(parts[0 : parts.index("artifacts")]).strip("/")
+            self.parsed_artifact_name = parts[-1]
+            self.parsed_job = fragments.get("job")
+            self.parsed_ref = fragments.get("ref")
+
+            artifact_path = "/".join(parts[parts.index("artifacts") + 1 :])
+
+            if "ref" in fragments and not self.gitlab_token_is_pat:
+                # NOTE: We have "ref" and "job" but we don't have a Personal Access Token (PAT). We
+                # can't resolve the job ID using the API and a CI job token can't be used for this.
+                #
+                # TODO: Find a way to resolve the job ID without requiring private tokens so that we
+                # can use a single endpoint (and we can always store the job ID inside the stamp
+                # file).
+                self.parsed_endpoint_url = "/projects/%s/jobs/artifacts/%s/raw/%s?job=%s" % (
+                    urllib.parse.quote_plus(self.parsed_project_name),
+                    urllib.parse.quote_plus(fragments["ref"]),
+                    artifact_path,
+                    urllib.parse.quote_plus(fragments["job"]),
+                )
+            else:
+                if "ref" in fragments and self.gitlab_token_is_pat:
+                    print_msg("resolving job id for " + self.parsed_artifact_name, self._comment())
+                    self.stamp["job_id"] = self._resolve_job_id(
+                        self.parsed_project_name,
+                        fragments["ref"],
+                        fragments["job"],
+                    )
+                else:
+                    self.stamp["job_id"] = str(fragments["job"])
+
+                self.parsed_endpoint_url = "/projects/%s/jobs/%s/artifacts/%s" % (
+                    urllib.parse.quote_plus(self.parsed_project_name),
+                    self.stamp["job_id"],
+                    artifact_path,
+                )
+        elif url.scheme == "gitlab+package":
+            project_name, package_name, package_version, package_file_name = url.path.rsplit("/", 3)
+
+            self.parsed_project_name = project_name.strip("/")
+            self.parsed_artifact_name = package_file_name
+            self.parsed_pkg = "%s/%s/%s" % (package_name, package_version, package_file_name)
+            self.parsed_endpoint_url = "/projects/%s/packages/generic/%s" % (
+                urllib.parse.quote_plus(self.parsed_project_name),
+                self.parsed_pkg,
+            )
+        else:
+            raise QuarkError("Unsupported URL: " + url)
+
+    def _resolve_job_id(self, project: str, ref: str, job_name: str) -> str:
+        # NOTE: This method requires an API token. A CI job token isn't sufficient. As such, this
+        # should be called only when freezing (usually done by a developer with a private token).
+
+        # Latest pipeline for given ref
+        req = urllib.request.Request(
+            url="%s/api/v4/projects/%s/pipelines/latest?ref=%s" % (
+                self.gitlab_url,
+                urllib.parse.quote_plus(project),
+                urllib.parse.quote_plus(ref),
+            ),
+            headers={
+                self.gitlab_token_header: self.gitlab_token,
+            },
+        )
+
+        with urllib.request.urlopen(req) as response:
+            pipeline = json.loads(response.read().decode("utf-8"))
+
+        # Jobs in latest pipeline
+        req = urllib.request.Request(
+            url="%s/api/v4/projects/%s/pipelines/%s/jobs" % (
+                self.gitlab_url,
+                urllib.parse.quote_plus(project),
+                pipeline["id"],
+            ),
+            headers={
+                self.gitlab_token_header: self.gitlab_token,
+            },
+        )
+
+        with urllib.request.urlopen(req) as response:
+            jobs = json.loads(response.read().decode("utf-8"))
+
+        for job in jobs:
+            if job["name"] == job_name:
+                return str(job["id"])
+
+        raise QuarkError("Could not find job %s in pipeline %s" % (job_name, pipeline["id"]))
+
+    def _download(self, tempdir: str) -> str:
+        assert self.parsed_artifact_name  # Make Pyright happy
+        assert self.parsed_endpoint_url  # Make Pyright happy
+
+        print_msg("downloading " + self.parsed_artifact_name, self._comment())
+
+        dl_dir = join(tempdir, "dl")
+        archive_path = join(dl_dir, self.parsed_artifact_name)
+
+        os.mkdir(dl_dir)
+
+        req = urllib.request.Request(
+            url="%s/api/v4/%s" % (self.gitlab_url, self.parsed_endpoint_url.lstrip("/")),
+            headers={
+                self.gitlab_token_header: self.gitlab_token,
+            },
+        )
+
+        with urllib.request.urlopen(req) as response:
+            with open(archive_path, "wb") as fileobj:
+                shutil.copyfileobj(response, fileobj)
+
+        # Verify or update the SHA1
+        print_msg("verifying " + self.parsed_artifact_name, self._comment())
+        with open(archive_path, "rb") as fileobj:
+            sha1 = hashlib.sha1(fileobj.read()).hexdigest()
+
+        if self.stamp["sha1"] and sha1 != self.stamp["sha1"]:
+            raise QuarkError("SHA1 mismatch: %s != %s" % (sha1, self.stamp["sha1"]))
+
+        self.stamp["sha1"] = sha1
+
+        return archive_path
+
+    def _extract(self, archive_path: str, tempdir: str):
+        assert self.directory  # Make Pyright happy
+
+        print_msg("extracting " + self.parsed_artifact_name, self._comment())
+
+        extract_dir = join(tempdir, "extract")
+        os.mkdir(extract_dir)
+
+        if archive_path.endswith((".tar.bz2", ".tar.gz", ".tar.xz")):
+            with tarfile.open(archive_path, "r") as tar:
+                tar.extractall(extract_dir)
+        elif archive_path.endswith(".zip"):
+            with zipfile.ZipFile(archive_path, "r") as zip:
+                zip.extractall(extract_dir)
+        else:
+            raise QuarkError("Unsupported format: " + archive_path)
+
+        # Move files into place
+        os.mkdir(self.directory)
+        items = os.listdir(extract_dir)
+        if len(items) == 1 and isdir(items[0]):
+            # Archive created a single directory, move its contents
+            for i in os.listdir(join(extract_dir, items[0])):
+                shutil.move(join(extract_dir, items[0], i), self.directory)
+        else:
+            # Archive is a tarbomb
+            for i in items:
+                shutil.move(join(extract_dir, i), self.directory)
+
+    def _comment(self) -> str:
+        ret = "from " + self.parsed_project_name
+        if self.parsed_ref:
+            ret += ", ref: " + self.parsed_ref
+        if self.parsed_job:
+            ret += ", job: " + self.parsed_job
+        if self.parsed_pkg:
+            ret += ", pkg: " + self.parsed_pkg
+        return ret
 
 def generate_cmake_script(source_dir, url=None, options=None, print_tree=False,update=True, clean=False, clobber=False, fix_remotes = False):
     root, modules = Subproject.create_dependency_tree(source_dir, url, options, update=update, clean=clean, clobber=clobber, fix_remotes = fix_remotes)
