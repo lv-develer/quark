@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from quark.utils import cmake_escape
 import hashlib
 import shutil
+import stat
 import tempfile
 import tarfile
 import zipfile
@@ -750,7 +751,9 @@ class GitlabSubproject(Subproject):
                 self._extract(archive_path, tempdir)
             else:
                 os.mkdir(self.directory)
-                shutil.copy2(archive_path, self.directory)
+                target = shutil.copy2(archive_path, self.directory)
+                if self.make_executable:
+                    os.chmod(target, os.stat(target).st_mode | stat.S_IXUSR)
 
         # Update the stamp file
         with open(stamp_file, "w") as fileobj:
@@ -822,6 +825,9 @@ class GitlabSubproject(Subproject):
         self.parsed_pkg = None
 
         self.stamp["sha1"] = fragments.get("sha1")
+
+        # Whether to make the downloaded file executable.
+        self.make_executable: bool = fragments.get("executable", "").lower() == "true"
 
         if url.scheme == "gitlab+ci":
             if "job" not in fragments:
